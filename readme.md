@@ -1,30 +1,46 @@
 # National Risk Intelligence Platform (MODEL-X) — Advanced Edition
 
-A Streamlit-based risk intelligence system for Sri Lanka with continuous multi-source
-data collection, deterministic risk scoring, anomaly detection, 7-day forecasting,
-AI executive summaries, alert dispatch, and full-text search.
+A Streamlit-based risk intelligence system for Sri Lanka that continuously collects news from RSS feeds, Reddit, and GDELT, applies deterministic risk scoring, and presents data through interactive dashboards with geospatial visualization and health monitoring.
 
----
+## Overview
 
-## What's New (vs. Original)
+**Core Functionality:**
+- Continuous background data collection from 9+ sources (RSS feeds, Reddit, GDELT, World Bank indicators)
+- Deterministic risk scoring (1-10 scale) based on sentiment, crisis keywords, source reliability, and industry classification
+- SQLite database with automatic deduplication
+- Multi-tab Streamlit dashboards with geospatial maps, analytics, live feeds, and source health monitoring
+- CSV export of filtered data
 
-| Feature | Before | After |
-|---|---|---|
-| Database | Basic SQLite | WAL + FTS5 full-text search, hourly aggregates, anomaly log, alert log, auto-pruning |
-| Scoring | 4-component formula | Same formula + 6 extra crisis keywords (collapse, explosion, sanction, default, devaluation, contamination) |
-| Anomaly detection | None | Rolling z-score + IQR over hourly buckets, persisted to DB, banner in UI |
-| Forecasting | None | Holt-Winters + linear trend blend, 7-day per-category with 95% CI bands |
-| AI summaries | None | Optional Anthropic API integration for critical signal executive summaries |
-| Alert dispatch | None | Webhook (Slack/Teams/Discord) + SMTP email for critical alerts |
-| FTS search | Substring only | SQLite FTS5 virtual table with `MATCH` ranking |
-| Dashboard tabs | 4 | 5 (added Forecast tab; Source Health inline) |
-| Geospatial | ScatterplotLayer | ScatterplotLayer + HeatmapLayer + city breakdown table |
-| Analytics | 4 charts | 6 charts (added hourly bar chart, category timeline, correlation heatmap) |
-| Config | Minimal | Full feature flags, alert settings, risk thresholds, retention config |
-| DB maintenance | None | Automatic pruning (RETENTION_DAYS), VACUUM, MAX_DB_RECORDS cap |
-| Health monitor | In-memory only | Type-aggregated stats, type summary, richer export |
+## Implemented Features
 
----
+**Data Collection:**
+- 10 active Sri Lankan news RSS feeds (Ada Derana, Daily Mirror, Economy Next, Gossip Lanka, Groundviews, Lanka Guardian, Colombo Telegraph, Island.lk, and others)
+- 8 Sri Lanka-related subreddits (srilanka, Colombo, Kandy, Galle, Jaffna, srilankans, srilanka_memes, ceylon) with relevance filtering
+- GDELT global events database (no API key required)
+- World Bank macroeconomic indicators (inflation, GDP, unemployment)
+- NewsAPI integration (optional, requires `NEWS_API_KEY` environment variable)
+
+**Risk Scoring Algorithm (Deterministic):**
+- Base score: 4.0, adjusted by:
+  - VADER sentiment analysis (negative sentiment increases risk)
+  - Crisis keyword detection (26+ weighted terms: crisis, emergency, attack, violence, etc.)
+  - Source reliability weighting (NewsAPI: 0.95, GDELT: 0.85, RSS: 0.80, Reddit: 0.55)
+  - Industry classification boost (Energy, Logistics, Finance, Tourism, Agriculture, Public Safety)
+  - Confidence scoring based on text length, keyword strength, and sentiment magnitude
+- Final score clamped to 1-10 range
+
+**Dashboard Visualization:**
+1. **Geospatial View** - Interactive Pydeck map of Sri Lanka with risk points color-coded by severity
+2. **Business Analytics** - Activity trends, trending keywords, risk distribution histogram, industry impact pie chart
+3. **Live Risk Feed** - Top 20 risks displayed as cards with source, score, sentiment, category, and links
+4. **Health Monitor** - Source status table, performance graphs, collection logs, detailed statistics
+
+**Core Operations:**
+- Auto-start background collector thread (configurable interval, default 120 seconds)
+- Multi-source fallback strategy with retry logic (exponential backoff with jitter)
+- SQLite persistence with MD5-based deduplication
+- 30-day historical data retrieval from GDELT
+- Sidebar controls: collector start/stop, filtering, settings, demo crisis injection, CSV export
 
 ## Project Structure
 
