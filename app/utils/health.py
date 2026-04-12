@@ -1,280 +1,223 @@
 """
-Health monitoring system for data collection sources.
-Tracks source health, uptime, and provides dashboards metrics.
+MODEL-X Health Monitor
+Tracks per-source health, computes uptime, and surfaces dashboard metrics.
 """
-import logging
-from datetime import datetime, timedelta
-from typing import Dict, Any, List
-from collections import defaultdict
 import json
+import logging
+from collections import defaultdict
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 
 class SourceHealth:
-    """Individual source health tracking."""
-    
-    def __init__(self, source_name: str, source_type: str = 'unknown'):
-        self.source_name = source_name
-        self.source_type = source_type
-        self.last_fetch = None
+    def __init__(self, name: str, stype: str = "unknown"):
+        self.source_name = name
+        self.source_type = stype
+        self.last_fetch:   Optional[datetime] = None
         self.success_count = 0
         self.failure_count = 0
-        self.last_error = None
-        self.items_count = 0
-        self.total_items_collected = 0
-        self.total_items_failed = 0
-        self.created_at = datetime.now()
-    
-    def record_success(self, items_count: int = 0):
-        """Log successful fetch."""
-        self.last_fetch = datetime.now()
+        self.last_error:   Optional[str] = None
+        self.items_count   = 0
+        self.total_items   = 0
+        self.created_at    = datetime.now()
+
+    def record_success(self, items: int = 0):
+        self.last_fetch    = datetime.now()
         self.success_count += 1
-        self.items_count = items_count
-        self.total_items_collected += max(0, items_count)
-        self.last_error = None
-        logger.info(f"✓ {self.source_name}: Success ({items_count} items)")
-    
+        self.items_count   = max(0, items)
+        self.total_items  += max(0, items)
+        self.last_error    = None
+
     def record_failure(self, error: str):
-        """Log failed fetch."""
-        self.last_fetch = datetime.now()
+        self.last_fetch    = datetime.now()
         self.failure_count += 1
-        self.last_error = error
-        logger.error(f"✗ {self.source_name}: {error}")
-    
+        self.last_error    = error
+
     def is_healthy(self, timeout_hours: int = 2) -> bool:
-        """Check if source is healthy (fetched recently and not too many failures)."""
         if self.last_fetch is None:
             return False
-        
-        time_since_last_fetch = datetime.now() - self.last_fetch
-        is_fresh = time_since_last_fetch < timedelta(hours=timeout_hours)
-        
-        # If too many failures relative to successes, mark unhealthy
-        if self.success_count > 0:
-            failure_rate = self.failure_count / (self.success_count + self.failure_count)
-            is_not_failing = failure_rate < 0.5
-        else:
-            is_not_failing = self.failure_count < 3
-        
-        return is_fresh and is_not_failing
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get comprehensive health statistics."""
-        total_attempts = self.success_count + self.failure_count
-        success_rate = (self.success_count / total_attempts * 100) if total_attempts > 0 else 0
-        
-        time_since_fetch = None
-        if self.last_fetch:
-            time_since_fetch = str(datetime.now() - self.last_fetch).split('.')[0]
-        
-        if total_attempts == 0:
-            status = 'no_data'
-        else:
-            status = 'healthy' if self.is_healthy() else 'unhealthy'
+        fresh = datetime.now() - self.last_fetch < timedelta(hours=timeout_hours)
+        total = self.success_count + self.failure_count
+        if total == 0:
+            return False
+        ok_rate = self.failure_count / total
+        return fresh and ok_rate < 0.5
 
+    def get_stats(self) -> Dict[str, Any]:
+        total = self.success_count + self.failure_count
+        rate  = (self.success_count / total * 100) if total else 0
+        since = str(datetime.now() - self.last_fetch).split(".")[0] if self.last_fetch else None
+        status = ("no_data" if total == 0
+                  else "healthy" if self.is_healthy()
+                  else "unhealthy")
         return {
-            'source_name': self.source_name,
-            'source_type': self.source_type,
-            'status': status,
-            'last_fetch': self.last_fetch.isoformat() if self.last_fetch else 'Never',
-            'time_since_last_fetch': time_since_fetch,
-            'success_count': self.success_count,
-            'failure_count': self.failure_count,
-            'total_attempts': total_attempts,
-            'success_rate': f"{success_rate:.1f}%",
-            'last_items_count': self.items_count,
-            'total_items_collected': self.total_items_collected,
-            'last_error': self.last_error or 'None',
-            'uptime_days': (datetime.now() - self.created_at).days
+            "source_name":         self.source_name,
+            "source_type":         self.source_type,
+            "status":              status,
+            "last_fetch":          self.last_fetch.isoformat() if self.last_fetch else "Never",
+            "time_since_last_fetch": since,
+            "success_count":       self.success_count,
+            "failure_count":       self.failure_count,
+            "total_attempts":      total,
+            "success_rate":        f"{rate:.1f}%",
+            "last_items_count":    self.items_count,
+            "total_items_collected": self.total_items,
+            "last_error":          self.last_error or "None",
+            "uptime_days":         (datetime.now() - self.created_at).days,
         }
+
+
+_TYPE_MAP = {
+    "rss -": "RSS", "ada derana": "RSS", "daily mirror": "RSS",
+    "lanka business online": "RSS", "news first": "RSS", "groundviews": "RSS",
+    "sri lanka guardian": "RSS", "economy next": "RSS",
+    "colombo telegraph": "RSS", "lanka news web": "RSS",
+    "island.lk": "RSS", "gossip lanka": "RSS", "ceylon today": "RSS",
+}
 
 
 class HealthMonitor:
-    """Central health monitoring system for all data sources."""
-    
     def __init__(self):
         self.sources: Dict[str, SourceHealth] = {}
-        self.collection_logs: List[Dict[str, Any]] = []
-        self.max_logs = 1000  # Keep last 1000 logs
+        self.logs:    List[Dict[str, Any]]    = []
+        self._max_logs = 2000
 
-    def _infer_source_type(self, source_name: str, source_type: str = 'unknown') -> str:
-        if source_type != 'unknown':
-            return source_type
+    def _infer_type(self, name: str, stype: str) -> str:
+        if stype not in ("unknown", ""):
+            return stype
+        s = (name or "").lower()
+        if any(s.startswith(k) or s == k for k in _TYPE_MAP):
+            return "RSS"
+        if "reddit" in s:
+            return "Social"
+        if s in {"newsapi", "gdelt", "worldbank", "newsapi_multi-source"}:
+            return "API"
+        return "unknown"
 
-        source = (source_name or '').lower()
-        if source.startswith('rss -') or source in {'ada derana', 'daily mirror', 'lanka business online', 'news first', 'groundviews', 'sri lanka guardian', 'economy next', 'colombo telegraph', 'lanka news web', 'island.lk', 'gossip lanka', 'ceylon today'}:
-            return 'RSS'
-        if source.startswith('reddit'):
-            return 'Social'
-        if source in {'newsapi', 'gdelt', 'worldbank'}:
-            return 'API'
-        return 'unknown'
-    
-    def register_source(self, source_name: str, source_type: str = 'unknown') -> SourceHealth:
-        """Register a new data source for monitoring."""
-        inferred_type = self._infer_source_type(source_name, source_type)
+    def register_source(self, name: str, stype: str = "unknown") -> SourceHealth:
+        t = self._infer_type(name, stype)
+        if name not in self.sources:
+            self.sources[name] = SourceHealth(name, t)
+        elif self.sources[name].source_type == "unknown" and t != "unknown":
+            self.sources[name].source_type = t
+        return self.sources[name]
 
-        if source_name not in self.sources:
-            self.sources[source_name] = SourceHealth(source_name, inferred_type)
-            logger.info(f"📊 Registered source for monitoring: {source_name}")
-        elif self.sources[source_name].source_type == 'unknown' and inferred_type != 'unknown':
-            self.sources[source_name].source_type = inferred_type
-        return self.sources[source_name]
-    
-    def record_fetch(self, source_name: str, success: bool, items_count: int = 0, error: str = None):
-        """Record a fetch attempt."""
-        self.register_source(source_name)
-        
-        source = self.sources[source_name]
-        
+    def record_fetch(self, name: str, success: bool, items: int = 0, error: str = None):
+        self.register_source(name)
         if success:
-            source.record_success(items_count)
+            self.sources[name].record_success(items)
         else:
-            source.record_failure(error or 'Unknown error')
-        
-        # Add to collection logs
-        log_entry = {
-            'timestamp': datetime.now().isoformat(),
-            'source': source_name,
-            'success': success,
-            'items': items_count,
-            'error': error
-        }
-        self.collection_logs.append(log_entry)
-        
-        # Keep only recent logs
-        if len(self.collection_logs) > self.max_logs:
-            self.collection_logs = self.collection_logs[-self.max_logs:]
-    
-    def get_source_health(self, source_name: str = None) -> Dict[str, Any]:
-        """Get health stats for specific source or all sources."""
-        if source_name:
-            if source_name in self.sources:
-                return self.sources[source_name].get_stats()
-            return None
-        else:
-            return {name: health.get_stats() for name, health in self.sources.items()}
-    
+            self.sources[name].record_failure(error or "Unknown error")
+        self.logs.append({
+            "timestamp": datetime.now().isoformat(),
+            "source":    name,
+            "success":   success,
+            "items":     items,
+            "error":     error,
+        })
+        if len(self.logs) > self._max_logs:
+            self.logs = self.logs[-self._max_logs:]
+
+    def get_source_health(self, name: str = None):
+        if name:
+            return self.sources[name].get_stats() if name in self.sources else None
+        return {n: h.get_stats() for n, h in self.sources.items()}
+
     def get_overall_health(self) -> Dict[str, Any]:
-        """Get overall system health status."""
         if not self.sources:
             return {
-                'overall_status': 'no_data',
-                'message': 'No sources registered yet',
-                'timestamp': datetime.now().isoformat(),
-                'healthy_sources': 0,
-                'active_sources': 0,
-                'total_sources': 0,
-                'health_percentage': '0.0%',
-                'overall_success_rate': '0.0%',
-                'total_attempts': 0,
-                'best_performing': 'N/A',
-                'worst_performing': 'N/A',
-                'uptime': {
-                    'successful_collections': 0,
-                    'failed_collections': 0
-                }
+                "overall_status": "no_data", "message": "No sources registered",
+                "timestamp": datetime.now().isoformat(),
+                "healthy_sources": 0, "active_sources": 0, "total_sources": 0,
+                "health_percentage": "0.0%", "overall_success_rate": "0.0%",
+                "total_attempts": 0, "best_performing": "N/A", "worst_performing": "N/A",
+                "uptime": {"successful_collections": 0, "failed_collections": 0},
             }
+        active = [s for s in self.sources.values() if s.success_count + s.failure_count > 0]
+        healthy = sum(1 for s in active if s.is_healthy())
+        total_s  = sum(s.success_count for s in self.sources.values())
+        total_f  = sum(s.failure_count for s in self.sources.values())
+        total_a  = total_s + total_f
+        rate = (total_s / total_a * 100) if total_a else 0
+        best  = max(active, key=lambda s: s.success_count - s.failure_count, default=None)
+        worst = min(active, key=lambda s: s.success_count - s.failure_count, default=None)
+        status = ("healthy" if active and healthy / len(active) >= 0.7
+                  else "degraded" if active else "no_data")
+        pct = f"{(healthy / len(active) * 100):.1f}%" if active else "0.0%"
+        return {
+            "timestamp":            datetime.now().isoformat(),
+            "overall_status":       status,
+            "healthy_sources":      healthy,
+            "active_sources":       len(active),
+            "total_sources":        len(self.sources),
+            "health_percentage":    pct,
+            "overall_success_rate": f"{rate:.1f}%",
+            "total_attempts":       total_a,
+            "best_performing":      best.source_name  if best  else "N/A",
+            "worst_performing":     worst.source_name if worst else "N/A",
+            "uptime": {"successful_collections": total_s, "failed_collections": total_f},
+        }
 
-        active_sources_list = [
-            s for s in self.sources.values() if (s.success_count + s.failure_count) > 0
-        ]
-        active_sources = len(active_sources_list)
-        healthy_sources = sum(1 for s in active_sources_list if s.is_healthy())
-        total_sources = len(self.sources)
-        
-        overall_success_count = sum(s.success_count for s in self.sources.values())
-        overall_failure_count = sum(s.failure_count for s in self.sources.values())
-        total_attempts = overall_success_count + overall_failure_count
-        overall_success_rate = (overall_success_count / total_attempts * 100) if total_attempts > 0 else 0
-        
-        if active_sources_list:
-            worst_source = min(
-                active_sources_list,
-                key=lambda s: s.success_count - s.failure_count,
-                default=None
-            )
-            best_source = max(
-                active_sources_list,
-                key=lambda s: s.success_count - s.failure_count,
-                default=None
-            )
-            overall_status = 'healthy' if healthy_sources / active_sources >= 0.7 else 'degraded'
-            health_percentage = f"{(healthy_sources / active_sources * 100):.1f}%"
-        else:
-            worst_source = None
-            best_source = None
-            overall_status = 'no_data'
-            health_percentage = '0.0%'
-        
-        return {
-            'timestamp': datetime.now().isoformat(),
-            'overall_status': overall_status,
-            'healthy_sources': healthy_sources,
-            'active_sources': active_sources,
-            'total_sources': total_sources,
-            'health_percentage': health_percentage,
-            'overall_success_rate': f"{overall_success_rate:.1f}%",
-            'total_attempts': total_attempts,
-            'best_performing': best_source.source_name if best_source else 'N/A',
-            'worst_performing': worst_source.source_name if worst_source else 'N/A',
-            'uptime': {
-                'successful_collections': overall_success_count,
-                'failed_collections': overall_failure_count
-            }
-        }
-    
-    def get_recent_logs(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """Get recent collection logs."""
-        return self.collection_logs[-limit:]
-    
+    def get_recent_logs(self, n: int = 100):
+        return self.logs[-n:]
+
     def get_dashboard_data(self) -> Dict[str, Any]:
-        """Get all data needed for the health dashboard."""
         return {
-            'overall_health': self.get_overall_health(),
-            'sources_health': self.get_source_health(),
-            'recent_logs': self.get_recent_logs(50),
-            'timestamp': datetime.now().isoformat()
+            "overall_health":  self.get_overall_health(),
+            "sources_health":  self.get_source_health(),
+            "recent_logs":     self.get_recent_logs(100),
+            "timestamp":       datetime.now().isoformat(),
         }
-    
+
     def export_health_report(self, filepath: str = None) -> str:
-        """Export health report as JSON."""
         report = {
-            'generated_at': datetime.now().isoformat(),
-            'overall_health': self.get_overall_health(),
-            'detailed_sources': self.get_source_health(),
-            'recent_logs': self.get_recent_logs(100)
+            "generated_at":    datetime.now().isoformat(),
+            "overall_health":  self.get_overall_health(),
+            "detailed_sources": self.get_source_health(),
+            "recent_logs":     self.get_recent_logs(200),
         }
-        
-        report_json = json.dumps(report, indent=2)
-        
+        out = json.dumps(report, indent=2)
         if filepath:
             try:
-                with open(filepath, 'w') as f:
-                    f.write(report_json)
-                logger.info(f"Health report exported to {filepath}")
+                with open(filepath, "w") as f:
+                    f.write(out)
             except Exception as e:
-                logger.error(f"Failed to export health report: {e}")
-        
-        return report_json
+                logger.error(f"Health report export failed: {e}")
+        return out
+
+    def get_type_summary(self) -> Dict[str, Dict[str, Any]]:
+        """Aggregate health by source type."""
+        by_type: Dict[str, list] = defaultdict(list)
+        for s in self.sources.values():
+            by_type[s.source_type].append(s)
+        result = {}
+        for t, sources in by_type.items():
+            ok = sum(s.success_count for s in sources)
+            fail = sum(s.failure_count for s in sources)
+            result[t] = {
+                "source_count": len(sources),
+                "total_success": ok,
+                "total_failure": fail,
+                "success_rate": f"{ok/(ok+fail)*100:.1f}%" if (ok+fail) else "0.0%",
+            }
+        return result
 
 
-# Global health monitor instance
+# ── Singleton & pre-registration ─────────────────────────────────────────────
 health_monitor = HealthMonitor()
 
-# Pre-register known sources
-health_monitor.register_source('Ada Derana', 'RSS')
-health_monitor.register_source('Daily Mirror', 'RSS')
-health_monitor.register_source('Lanka Business Online', 'RSS')
-health_monitor.register_source('News First', 'RSS')
-health_monitor.register_source('Groundviews', 'RSS')
-health_monitor.register_source('Sri Lanka Guardian', 'RSS')
-health_monitor.register_source('Economy Next', 'RSS')
-health_monitor.register_source('Colombo Telegraph', 'RSS')
-health_monitor.register_source('Lanka News Web', 'RSS')
-health_monitor.register_source('Island.lk', 'RSS')
-health_monitor.register_source('NewsAPI', 'API')
-health_monitor.register_source('GDELT', 'API')
-health_monitor.register_source('WorldBank', 'API')
-health_monitor.register_source('Reddit - Mixed Subreddits', 'Social')
+_PRE_REGISTER = [
+    ("Ada Derana", "RSS"), ("Daily Mirror", "RSS"),
+    ("Lanka Business Online", "RSS"), ("News First", "RSS"),
+    ("Groundviews", "RSS"), ("Sri Lanka Guardian", "RSS"),
+    ("Economy Next", "RSS"), ("Colombo Telegraph", "RSS"),
+    ("Lanka News Web", "RSS"), ("Island.lk", "RSS"),
+    ("Gossip Lanka", "RSS"), ("Ceylon Today", "RSS"),
+    ("NewsAPI", "API"), ("GDELT", "API"),
+    ("WorldBank", "API"), ("NewsAPI_Multi-Source", "API"),
+    ("Reddit - Mixed Subreddits", "Social"),
+]
+for _name, _type in _PRE_REGISTER:
+    health_monitor.register_source(_name, _type)

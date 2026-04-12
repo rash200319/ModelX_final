@@ -1,315 +1,434 @@
-import time
-import threading
-import uuid
+"""
+MODEL-X Risk Collector
+Advanced background collector with:
+  - Deterministic, explainable risk scoring
+  - Anomaly detection (z-score + IQR)
+  - AI-powered signal summarisation (optional, via Anthropic API)
+  - Alert dispatch (webhook / email)
+  - Automatic DB pruning
+  - Per-cycle performance metrics
+"""
+import asyncio
 import logging
 import re
-import asyncio
+import threading
+import time
+import uuid
 from datetime import datetime
-from nltk.sentiment import SentimentIntensityAnalyzer
+from typing import Any, Dict, List, Optional, Tuple
+
 import nltk
 import pandas as pd
+from nltk.sentiment import SentimentIntensityAnalyzer
+
+from config import (
+    FETCH_LIMIT, REFRESH_INTERVAL, RISK_CRITICAL,
+    FEATURE_AI_SUMMARY, FEATURE_ANOMALY_DETECT, FEATURE_ALERTS,
+    ANTHROPIC_API_KEY, ALERT_WEBHOOK_URL,
+)
 from database_manager import db
-from config import FETCH_LIMIT, REFRESH_INTERVAL
 from utils.sources import multi_source_collector
 from utils.health import health_monitor
-
-# Configure logging
-logger = logging.getLogger(__name__)
-
-# Initialize VADER sentiment analyzer
-try:
-    nltk.data.find('vader_lexicon')
-except LookupError:
-    nltk.download('vader_lexicon', quiet=True)
-sia = SentimentIntensityAnalyzer()
-
-# Import Feed Fetchers
+from utils.alerts import dispatch_alert
 from modules.social import get_reddit_rss
 
-# --- INDUSTRY KEYWORDS (BUSINESS CONTEXT) ---
-INDUSTRIES = {
-    "Energy & Fuel": ["power", "electricity", "fuel", "gas", "petrol", "energy", "grid", "ceb", "cpc"],
-    "Logistics & Transport": ["road", "traffic", "train", "bus", "port", "shipping", "airline", "flight", "transport"],
-    "Finance & Economy": ["rupee", "dollar", "bank", "tax", "inflation", "stock", "market", "imf", "debt", "economy"],
-    "Tourism": ["tourist", "hotel", "visa", "airport", "travel", "resort", "booking"],
-    "Agriculture": ["farmer", "crop", "rice", "fertilizer", "food", "tea", "export"],
-    "Public Safety": ["protest", "strike", "curfew", "police", "attack", "violence", "disaster", "flood"]
-}
+logger = logging.getLogger(__name__)
 
+# ── NLTK bootstrap ───────────────────────────────────────────────────────────
+for _res in ("vader_lexicon",):
+    try:
+        nltk.data.find(_res)
+    except LookupError:
+        nltk.download(_res, quiet=True)
+sia = SentimentIntensityAnalyzer()
+
+# ── Industry taxonomy ─────────────────────────────────────────────────────────
+INDUSTRIES = {
+    "Energy & Fuel":         ["power", "electricity", "fuel", "gas", "petrol", "energy", "grid", "ceb", "cpc"],
+    "Logistics & Transport": ["road", "traffic", "train", "bus", "port", "shipping", "airline", "flight", "transport"],
+    "Finance & Economy":     ["rupee", "dollar", "bank", "tax", "inflation", "stock", "market", "imf", "debt", "economy"],
+    "Tourism":               ["tourist", "hotel", "visa", "airport", "travel", "resort", "booking"],
+    "Agriculture":           ["farmer", "crop", "rice", "fertilizer", "food", "tea", "export"],
+    "Public Safety":         ["protest", "strike", "curfew", "police", "attack", "violence", "disaster", "flood"],
+}
 HIGH_RISK_INDUSTRIES = {"Public Safety", "Energy & Fuel"}
 
-STRONG_INDUSTRY_KEYWORDS = {
-    "Energy & Fuel": {"blackout", "power cut", "fuel", "petrol"},
+STRONG_KEYWORDS: Dict[str, set] = {
+    "Energy & Fuel":         {"blackout", "power cut", "fuel", "petrol"},
     "Logistics & Transport": {"port", "airport", "shipping", "train", "bus"},
-    "Finance & Economy": {"bank", "fraud", "cbsl", "depositor", "depositor", "deposits", "imf"},
-    "Tourism": {"airport", "visa", "hotel"},
-    "Agriculture": {"fertilizer", "crop", "rice"},
-    "Public Safety": {"protest", "strike", "curfew", "attack", "violence", "disaster", "flood"},
+    "Finance & Economy":     {"bank", "fraud", "cbsl", "depositor", "deposits", "imf"},
+    "Tourism":               {"airport", "visa", "hotel"},
+    "Agriculture":           {"fertilizer", "crop", "rice"},
+    "Public Safety":         {"protest", "strike", "curfew", "attack", "violence", "disaster", "flood"},
 }
 
 SOURCE_RELIABILITY = {
-    "newsapi": 0.95,
-    "gdelt": 0.85,
-    "worldbank": 0.90,
-    "rss": 0.80,
-    "reddit": 0.55,
-    "default": 0.70,
+    "newsapi": 0.95, "gdelt": 0.85, "worldbank": 0.90,
+    "rss": 0.80,     "reddit": 0.55, "default": 0.70,
 }
 
 CRISIS_WEIGHTS = {
-    "crisis": 1.8,
-    "emergency": 2.4,
-    "alert": 1.2,
-    "warning": 1.0,
-    "attack": 2.4,
-    "dead": 2.0,
-    "kill": 2.2,
-    "violence": 2.0,
-    "protest": 1.6,
-    "strike": 1.6,
-    "curfew": 1.8,
-    "flood": 1.6,
-    "disaster": 2.0,
-    "riot": 2.2,
-    "shortage": 1.4,
-    "blackout": 1.6,
-    "power cut": 1.6,
-    "bankrupt": 2.0,
-    "debt": 1.2,
-    "inflation": 1.2,
-    "layoff": 1.3,
+    "crisis": 1.8, "emergency": 2.4, "alert": 1.2, "warning": 1.0,
+    "attack": 2.4, "dead": 2.0, "kill": 2.2, "violence": 2.0,
+    "protest": 1.6, "strike": 1.6, "curfew": 1.8, "flood": 1.6,
+    "disaster": 2.0, "riot": 2.2, "shortage": 1.4, "blackout": 1.6,
+    "power cut": 1.6, "bankrupt": 2.0, "debt": 1.2, "inflation": 1.2,
+    "layoff": 1.3, "collapse": 2.0, "explosion": 2.4, "fire": 1.5,
+    "contamination": 1.8, "sanction": 1.6, "default": 1.8, "devaluation": 1.7,
 }
 
 LOW_SIGNAL_PATTERNS = [
     "anyone", "recommend", "suggestions", "looking for",
-    "can someone", "help me", "advice", "where can i"
+    "can someone", "help me", "advice", "where can i",
 ]
 
-class RiskCollector:
-    def __init__(self):
-        self.is_running = False
-        self.thread = None
 
-    def _resolve_source_type(self, source_name: str) -> str:
-        source = (source_name or "").strip().lower()
-        if source.startswith("reddit"):
-            return "reddit"
-        if source == "newsapi":
-            return "newsapi"
-        if source == "gdelt":
-            return "gdelt"
-        if source == "worldbank":
-            return "worldbank"
+# ── Scoring engine ────────────────────────────────────────────────────────────
+
+class ScoringEngine:
+    """Deterministic, explainable risk scoring."""
+
+    @staticmethod
+    def _resolve_source(name: str) -> str:
+        s = (name or "").lower()
+        if s.startswith("reddit"): return "reddit"
+        if s == "newsapi":         return "newsapi"
+        if s == "gdelt":           return "gdelt"
+        if s == "worldbank":       return "worldbank"
         return "rss"
 
-    def _clamp(self, value: float, minimum: float, maximum: float) -> float:
-        return max(minimum, min(maximum, value))
+    @staticmethod
+    def _clamp(v, lo, hi): return max(lo, min(hi, v))
 
-    def _extract_industries(self, text_lower: str):
+    def extract_industries(self, text: str) -> List[str]:
         detected = []
-        for industry, keywords in INDUSTRIES.items():
-            keyword_hits = sum(1 for keyword in keywords if re.search(rf"\b{re.escape(keyword)}\b", text_lower))
-            strong_hits = sum(1 for keyword in STRONG_INDUSTRY_KEYWORDS.get(industry, set()) if re.search(rf"\b{re.escape(keyword)}\b", text_lower))
-            if strong_hits >= 1 or keyword_hits >= 2:
-                detected.append(industry)
+        for ind, kws in INDUSTRIES.items():
+            hits  = sum(1 for kw in kws if re.search(rf"\b{re.escape(kw)}\b", text))
+            strong = sum(1 for kw in STRONG_KEYWORDS.get(ind, set()) if re.search(rf"\b{re.escape(kw)}\b", text))
+            if strong >= 1 or hits >= 2:
+                detected.append(ind)
         return detected or ["General"]
 
-    def _analyze_context(self, text, source_name="default"):
+    def score(self, text: str, source_name: str = "default") -> Dict[str, Any]:
         """
-        Deterministic risk analysis.
-
-        Returns:
-            risk_score (1-10), sentiment_score (-1 to +1), industries (str), confidence (0-1)
+        Returns a dict with:
+          risk_score, sentiment, industries, confidence,
+          matched_keywords, risk_breakdown
         """
-        text_lower = text.lower().strip()
-        scores = sia.polarity_scores(text)
-        sentiment = scores["compound"]
+        tl = text.lower().strip()
+        sentiment = sia.polarity_scores(text)["compound"]
 
-        crisis_strength = 0.0
-        matched_keywords = []
-        seen = set()
-        for keyword, weight in CRISIS_WEIGHTS.items():
-            if re.search(rf"\b{re.escape(keyword)}\b", text_lower):
-                if keyword in seen:
-                    continue
-                crisis_strength += weight
-                matched_keywords.append(keyword)
-                seen.add(keyword)
+        crisis_strength, matched, seen = 0.0, [], set()
+        for kw, w in CRISIS_WEIGHTS.items():
+            if kw not in seen and re.search(rf"\b{re.escape(kw)}\b", tl):
+                crisis_strength += w
+                matched.append(kw)
+                seen.add(kw)
 
-        source_type = self._resolve_source_type(source_name)
-        source_reliability = SOURCE_RELIABILITY.get(source_type, SOURCE_RELIABILITY["default"])
+        src_type   = self._resolve_source(source_name)
+        reliability = SOURCE_RELIABILITY.get(src_type, SOURCE_RELIABILITY["default"])
+        industries  = self.extract_industries(tl)
 
-        industry_list = self._extract_industries(text_lower)
+        sent_c     = (-sentiment) * 1.5
+        crisis_c   = min(crisis_strength, 5.0)
+        source_c   = (reliability - 0.7) * 2.0
+        ind_c      = 0.6 if any(i in HIGH_RISK_INDUSTRIES for i in industries) else (0.3 if industries != ["General"] else 0.0)
 
-        # Deterministic, explainable risk formula.
-        # Start from neutral 5, then adjust by sentiment, crisis language, and source reliability.
-        sentiment_component = (-sentiment) * 1.5
-        crisis_component = min(crisis_strength, 5.0) * 1.0
-        source_component = (source_reliability - 0.7) * 2.0
-        industry_component = 0.6 if any(industry in HIGH_RISK_INDUSTRIES for industry in industry_list) else 0.3 if industry_list != ["General"] else 0.0
+        score = 4.0 + sent_c + crisis_c + source_c + ind_c
 
-        risk_score = 4.0 + sentiment_component + crisis_component + source_component + industry_component
-
-        if any(pattern in text_lower for pattern in LOW_SIGNAL_PATTERNS):
-            risk_score = min(risk_score, 4.0)
-
-        if "?" in text:
-            risk_score -= 1.0
-
-        # Hard floor for very strong crisis language, but still deterministic.
-        if crisis_strength >= 3.5 and len(matched_keywords) >= 2:
-            risk_score = max(risk_score, 8.0)
-
-        # Historical references should not look like current risk.
-        if re.search(r"\b(?:197|198|199|200)\d\b", text_lower):
-            risk_score -= 1.0
-
-        # Serious institutional questions should keep their weight; casual questions should soften.
+        if any(p in tl for p in LOW_SIGNAL_PATTERNS):
+            score = min(score, 4.0)
         if "?" in text and crisis_strength < 2.0:
-            risk_score -= 1.0
+            score -= 1.0
+        if crisis_strength >= 3.5 and len(matched) >= 2:
+            score = max(score, 8.0)
+        if re.search(r"\b(?:197|198|199|200)\d\b", tl):
+            score -= 1.0
+        if any(t in tl for t in ["bank", "fraud", "cbsl", "depositor", "deposits"]):
+            score += 1.0
 
-        # Economic/institutional failures deserve a modest boost.
-        if any(term in text_lower for term in ["bank", "fraud", "cbsl", "depositor", "depositor", "deposits"]):
-            risk_score += 1.0
+        score = int(round(self._clamp(score, 1.0, 10.0)))
 
-        risk_score = int(round(self._clamp(risk_score, 1.0, 10.0)))
+        txt_len_s = self._clamp(len(text) / 280.0, 0.0, 1.0)
+        kw_sig    = self._clamp(crisis_strength / 4.0, 0.0, 1.0)
+        conf = (reliability * 0.45) + (txt_len_s * 0.20) + (kw_sig * 0.25) + (abs(sentiment) * 0.10)
+        conf = round(self._clamp(conf, 0.1, 1.0), 2)
 
-        # Confidence reflects source reliability and signal strength, not just risk.
-        text_length_score = self._clamp(len(text) / 280.0, 0.0, 1.0)
-        keyword_signal_score = self._clamp(crisis_strength / 4.0, 0.0, 1.0)
-        sentiment_strength = abs(sentiment)
-
-        confidence = (
-            (source_reliability * 0.45) +
-            (text_length_score * 0.20) +
-            (keyword_signal_score * 0.25) +
-            (sentiment_strength * 0.10)
-        )
-        confidence = round(self._clamp(confidence, 0.1, 1.0), 2)
-
-        risk_breakdown = {
-            "sentiment": round(sentiment_component, 2),
-            "crisis": round(crisis_component, 2),
-            "source": round(source_component, 2),
-            "industry": round(industry_component, 2),
+        return {
+            "risk_score":      score,
+            "sentiment":       round(sentiment, 4),
+            "industries":      ", ".join(industries),
+            "confidence":      conf,
+            "keywords":        ", ".join(matched),
+            "risk_breakdown": str({
+                "sentiment": round(sent_c, 2),
+                "crisis":    round(crisis_c, 2),
+                "source":    round(source_c, 2),
+                "industry":  round(ind_c, 2),
+            }),
         }
 
-        return risk_score, sentiment, ", ".join(industry_list), confidence, ", ".join(matched_keywords), risk_breakdown
+
+engine = ScoringEngine()
+
+
+# ── Anomaly detection ─────────────────────────────────────────────────────────
+
+class AnomalyDetector:
+    """
+    Rolling z-score anomaly detection over the last N hours per category.
+    Also applies IQR fencing for robustness.
+    """
+
+    def __init__(self, window_hours: int = 6, z_threshold: float = 2.5):
+        self.window_hours  = window_hours
+        self.z_threshold   = z_threshold
+
+    def detect(self) -> List[Dict[str, Any]]:
+        if not FEATURE_ANOMALY_DETECT:
+            return []
+        try:
+            trend = db.get_hourly_trend(hours=self.window_hours * 4)
+            if trend.empty or "avg_score" not in trend.columns:
+                return []
+
+            anomalies = []
+            for cat, grp in trend.groupby("category"):
+                scores = grp["avg_score"].dropna()
+                if len(scores) < 4:
+                    continue
+                mu, sigma = scores.mean(), scores.std()
+                if sigma < 0.01:
+                    continue
+                latest = scores.iloc[-1]
+                z = (latest - mu) / sigma
+                if abs(z) >= self.z_threshold:
+                    peak = int(grp["max_score"].max())
+                    cnt  = int(grp["event_count"].sum())
+                    desc = (
+                        f"Anomaly in '{cat}': z={z:.2f}, "
+                        f"latest avg={latest:.1f}, baseline={mu:.1f}±{sigma:.1f}, "
+                        f"peak={peak}, events={cnt} (last {self.window_hours * 4}h)"
+                    )
+                    anomalies.append({
+                        "category": cat, "z": z, "peak": peak,
+                        "count": cnt, "desc": desc
+                    })
+                    db.log_anomaly(cat, z, peak, cnt, self.window_hours * 4, desc)
+                    logger.warning(f"🔔 ANOMALY: {desc}")
+
+            return anomalies
+        except Exception as e:
+            logger.error(f"AnomalyDetector.detect: {e}")
+            return []
+
+
+anomaly_detector = AnomalyDetector()
+
+
+# ── Optional AI summariser ────────────────────────────────────────────────────
+
+def _ai_summarise(signals: List[str]) -> Optional[str]:
+    """
+    Call Anthropic API to produce a concise 2-sentence executive summary
+    of the top risk signals.  Returns None if disabled or key absent.
+    """
+    if not FEATURE_AI_SUMMARY or not ANTHROPIC_API_KEY:
+        return None
+    try:
+        import anthropic
+        prompt = (
+            "You are a risk analyst for Sri Lanka. "
+            "Summarise the following news signals in exactly 2 sentences, "
+            "highlighting the most critical operational risks:\n\n"
+            + "\n".join(f"- {s}" for s in signals[:10])
+        )
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        msg = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return msg.content[0].text.strip()
+    except Exception as e:
+        logger.warning(f"AI summarise failed: {e}")
+        return None
+
+
+# ── Main collector ────────────────────────────────────────────────────────────
+
+class RiskCollector:
+
+    def __init__(self):
+        self.is_running  = False
+        self.thread: Optional[threading.Thread] = None
+        self.cycle_count = 0
+        self.last_cycle_ms = 0
+
+    # ── Item → scored record ──────────────────────────────────────────────
+
+    def _build_record(self, item: Dict[str, Any], prefix: str) -> Dict[str, Any]:
+        full_text   = f"{item.get('title', '')} {item.get('content', item.get('summary', ''))}"
+        source_name = item.get("source", prefix)
+        result      = engine.score(full_text, source_name)
+        return {
+            "id":              f"{prefix}_{uuid.uuid4().hex[:8]}",
+            "source":          source_name,
+            "signal":          item.get("title", ""),
+            "link":            item.get("url", item.get("link", "#")),
+            "published":       item.get("published", datetime.now().isoformat()),
+            "risk_score":      result["risk_score"],
+            "category":        result["industries"],
+            "location":        "Sri Lanka",
+            "district":        "",
+            "province":        "",
+            "keywords":        result["keywords"],
+            "confidence":      result["confidence"],
+            "risk_breakdown":  result["risk_breakdown"],
+            "sentiment_score": result["sentiment"],
+            "created_at":      datetime.now().isoformat(),
+        }
+
+    # ── Per-source fetch helpers ──────────────────────────────────────────
+
+    def _collect_news(self) -> int:
+        try:
+            items = multi_source_collector.collect_news_with_fallback(limit=FETCH_LIMIT)
+            if not items:
+                health_monitor.record_fetch("NewsAPI_Multi-Source", False, 0, "No items")
+                return 0
+            records = [self._build_record(it, "news") for it in items]
+
+            # Optional AI executive summary for critical signals
+            critical = [r["signal"] for r in records if r["risk_score"] >= RISK_CRITICAL]
+            if critical:
+                summary = _ai_summarise(critical)
+                if summary:
+                    for r in records:
+                        if r["risk_score"] >= RISK_CRITICAL:
+                            r["ai_summary"] = summary
+
+            n = db.batch_insert_risks(records)
+            health_monitor.record_fetch("NewsAPI_Multi-Source", True, n)
+            logger.info(f"   ✅ News: {n} new records inserted (from {len(items)} fetched)")
+            return n
+        except Exception as e:
+            logger.error(f"News collection error: {e}")
+            health_monitor.record_fetch("NewsAPI_Multi-Source", False, 0, str(e))
+            return 0
+
+    def _collect_reddit(self) -> int:
+        src = "Reddit - Mixed Subreddits"
+        try:
+            df = get_reddit_rss(limit=FETCH_LIMIT)
+            if df.empty:
+                health_monitor.record_fetch(src, False, 0, "No posts")
+                return 0
+            records = []
+            for _, row in df.iterrows():
+                raw = ""
+                try:
+                    raw = row.get("raw_data", "")
+                except Exception:
+                    pass
+                item = {
+                    "title":   row.get("title", ""),
+                    "content": raw,
+                    "source":  row.get("source", "Reddit"),
+                    "url":     row.get("link", "#"),
+                    "published": row.get("published", datetime.now().isoformat()),
+                }
+                records.append(self._build_record(item, "reddit"))
+            n = db.batch_insert_risks(records)
+            health_monitor.record_fetch(src, True, n)
+            logger.info(f"   ✅ Reddit: {n} new records inserted")
+            return n
+        except Exception as e:
+            logger.error(f"Reddit collection error: {e}")
+            health_monitor.record_fetch(src, False, 0, str(e))
+            return 0
+
+    # ── Alert dispatch ────────────────────────────────────────────────────
+
+    def _check_and_alert(self):
+        if not FEATURE_ALERTS:
+            return
+        try:
+            recent = db.get_risks(limit=50, min_score=RISK_CRITICAL)
+            # Only alert on records inserted in the last cycle
+            if recent.empty:
+                return
+            cutoff = (datetime.utcnow() - __import__("datetime").timedelta(seconds=REFRESH_INTERVAL + 30)).isoformat()
+            fresh  = recent[recent.get("created_at", pd.Series(dtype=str)) >= cutoff]
+            for _, row in fresh.iterrows():
+                payload = {
+                    "score":    row.get("risk_score"),
+                    "signal":   row.get("signal"),
+                    "source":   row.get("source"),
+                    "category": row.get("category"),
+                    "link":     row.get("link"),
+                }
+                dispatch_alert(payload, row.get("id", ""))
+        except Exception as e:
+            logger.warning(f"Alert check error: {e}")
+
+    # ── Main fetch cycle ──────────────────────────────────────────────────
 
     def fetch_realtime(self):
-        """Fetch news and social data with multi-source fallback and health tracking."""
-        print("📡 Running Smart Collection Cycle with Multi-Source Fallback...")
-        
-        # 1. NEWS COLLECTION WITH MULTI-SOURCE FALLBACK
-        try:
-            # Use multi-source fallback strategy
-            news_items = multi_source_collector.collect_news_with_fallback(limit=FETCH_LIMIT)
-            
-            if news_items:
-                risks = []
-                for item in news_items:
-                    # Combine title and content for better AI context
-                    full_text = f"{item.get('title', '')} {item.get('content', '')}"
-                    source_name = item.get('source', 'News')
-                    
-                    # --- AI PROCESSING ---
-                    score, sentiment, industries, confidence, matched_keywords, risk_breakdown = self._analyze_context(full_text, source_name)
-                    
-                    risks.append({
-                        "id": f"news_{uuid.uuid4().hex[:8]}",
-                        "source": source_name,
-                        "signal": item.get('title', ''),
-                        "link": item.get('url', '#'),
-                        "published": datetime.now().isoformat(),
-                        "risk_score": score,
-                        "category": industries,
-                        "location": "Sri Lanka",
-                        "district": "",
-                        "province": "",
-                        "keywords": matched_keywords,
-                        "confidence": confidence,
-                        "risk_breakdown": str(risk_breakdown),
-                        "sentiment_score": sentiment,
-                        "created_at": datetime.now().isoformat()
-                    })
-                
-                db.batch_insert_risks(risks)
-                print(f"   ✅ Processed {len(risks)} News items with AI.")
-                
-                # Record health metrics
-                health_monitor.record_fetch('NewsAPI_Multi-Source', True, len(risks))
-            else:
-                print("   ⚠️ No news items collected from any source")
-                health_monitor.record_fetch('NewsAPI_Multi-Source', False, 0, 'No items returned')
-                
-        except Exception as e:
-            print(f"❌ News Collection Error: {e}")
-            logger.error(f"News collection failed: {e}")
-            health_monitor.record_fetch('NewsAPI_Multi-Source', False, 0, str(e))
+        t0 = time.monotonic()
+        self.cycle_count += 1
+        logger.info(f"📡 Cycle #{self.cycle_count} — collecting…")
 
-        # 2. REDDIT COLLECTION WITH HEALTH TRACKING
-        try:
-            reddit_source = 'Reddit - Mixed Subreddits'
-            social_df = get_reddit_rss(limit=FETCH_LIMIT)
-            
-            if not social_df.empty:
-                s_risks = []
-                for _, row in social_df.iterrows():
-                    raw_summary = ''
-                    try:
-                        raw_summary = row.get('raw_data', '')
-                    except Exception:
-                        raw_summary = ''
+        total  = self._collect_news()
+        total += self._collect_reddit()
 
-                    full_text = f"{row.get('title', '')} {raw_summary}"
-                    source_name = row.get('source', 'Reddit')
-                    score, sentiment, industries, confidence, matched_keywords, risk_breakdown = self._analyze_context(full_text, source_name)
+        # Anomaly detection
+        anomalies = anomaly_detector.detect()
+        if anomalies:
+            logger.warning(f"🔔 {len(anomalies)} anomalies detected this cycle.")
 
-                    s_risks.append({
-                        "id": f"reddit_{uuid.uuid4().hex[:8]}",
-                        "source": source_name,
-                        "signal": row.get('title', ''),
-                        "link": row.get('link', '#'),
-                        "published": datetime.now().isoformat(),
-                        "risk_score": score,
-                        "category": industries,
-                        "location": "Sri Lanka",
-                        "district": "",
-                        "province": "",
-                        "keywords": matched_keywords,
-                        "confidence": confidence,
-                        "risk_breakdown": str(risk_breakdown),
-                        "sentiment_score": sentiment,
-                        "created_at": datetime.now().isoformat()
-                    })
-                
-                db.batch_insert_risks(s_risks)
-                print(f"   ✅ Processed {len(s_risks)} Reddit items with AI.")
-                
-                # Record health metrics
-                health_monitor.record_fetch(reddit_source, True, len(s_risks))
-            else:
-                print("   ⚠️ No Reddit posts fetched")
-                health_monitor.record_fetch(reddit_source, False, 0, 'No posts returned')
-                
-        except Exception as e:
-            print(f"❌ Reddit Collection Error: {e}")
-            logger.error(f"Reddit collection failed: {e}")
-            health_monitor.record_fetch('Reddit - Mixed Subreddits', False, 0, str(e))
+        # Alert dispatch for new critical signals
+        self._check_and_alert()
+
+        # Periodic DB maintenance (every 10 cycles ≈ every ~20 min)
+        if self.cycle_count % 10 == 0:
+            pruned = db.prune_old_records()
+            if pruned:
+                logger.info(f"🗑️  Pruned {pruned} stale DB records.")
+
+        elapsed = int((time.monotonic() - t0) * 1000)
+        self.last_cycle_ms = elapsed
+        logger.info(f"   Cycle #{self.cycle_count} complete: {total} new records in {elapsed}ms.")
 
     def run_loop(self):
-        # Ensure this worker thread always has its own event loop for async-compatible libraries.
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         while self.is_running:
-            self.fetch_realtime()
+            try:
+                self.fetch_realtime()
+            except Exception as e:
+                logger.error(f"Collector loop error: {e}")
             time.sleep(REFRESH_INTERVAL)
 
     def start(self):
-        if self.is_running: return
+        if self.is_running:
+            return
         self.is_running = True
         self.thread = threading.Thread(target=self.run_loop, daemon=True)
         self.thread.start()
-        print(f"🚀 AI Collector Started. Polling every {REFRESH_INTERVAL} seconds.")
+        logger.info(f"🚀 Collector started. Polling every {REFRESH_INTERVAL}s.")
+
+    def stop(self):
+        self.is_running = False
+        logger.info("🛑 Collector stopped.")
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "running":       self.is_running,
+            "cycle_count":   self.cycle_count,
+            "last_cycle_ms": self.last_cycle_ms,
+            "interval_s":    REFRESH_INTERVAL,
+        }
+
 
 collector = RiskCollector()

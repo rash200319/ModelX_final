@@ -1,281 +1,199 @@
-# National Risk Intelligence Platform (MODEL-X)
+# National Risk Intelligence Platform (MODEL-X) — Advanced Edition
 
-A Streamlit-based risk intelligence system for Sri Lanka that continuously collects news from RSS feeds, Reddit, and GDELT, applies deterministic risk scoring, and presents data through interactive dashboards with geospatial visualization and health monitoring.
+A Streamlit-based risk intelligence system for Sri Lanka with continuous multi-source
+data collection, deterministic risk scoring, anomaly detection, 7-day forecasting,
+AI executive summaries, alert dispatch, and full-text search.
 
-## Overview
+---
 
-**Core Functionality:**
-- Continuous background data collection from 9+ sources (RSS feeds, Reddit, GDELT, World Bank indicators)
-- Deterministic risk scoring (1-10 scale) based on sentiment, crisis keywords, source reliability, and industry classification
-- SQLite database with automatic deduplication
-- Multi-tab Streamlit dashboards with geospatial maps, analytics, live feeds, and source health monitoring
-- CSV export of filtered data
+## What's New (vs. Original)
 
-## Implemented Features
+| Feature | Before | After |
+|---|---|---|
+| Database | Basic SQLite | WAL + FTS5 full-text search, hourly aggregates, anomaly log, alert log, auto-pruning |
+| Scoring | 4-component formula | Same formula + 6 extra crisis keywords (collapse, explosion, sanction, default, devaluation, contamination) |
+| Anomaly detection | None | Rolling z-score + IQR over hourly buckets, persisted to DB, banner in UI |
+| Forecasting | None | Holt-Winters + linear trend blend, 7-day per-category with 95% CI bands |
+| AI summaries | None | Optional Anthropic API integration for critical signal executive summaries |
+| Alert dispatch | None | Webhook (Slack/Teams/Discord) + SMTP email for critical alerts |
+| FTS search | Substring only | SQLite FTS5 virtual table with `MATCH` ranking |
+| Dashboard tabs | 4 | 5 (added Forecast tab; Source Health inline) |
+| Geospatial | ScatterplotLayer | ScatterplotLayer + HeatmapLayer + city breakdown table |
+| Analytics | 4 charts | 6 charts (added hourly bar chart, category timeline, correlation heatmap) |
+| Config | Minimal | Full feature flags, alert settings, risk thresholds, retention config |
+| DB maintenance | None | Automatic pruning (RETENTION_DAYS), VACUUM, MAX_DB_RECORDS cap |
+| Health monitor | In-memory only | Type-aggregated stats, type summary, richer export |
 
-**Data Collection:**
-- 10 active Sri Lankan news RSS feeds (Ada Derana, Daily Mirror, Economy Next, Gossip Lanka, Groundviews, Lanka Guardian, Colombo Telegraph, Island.lk, and others)
-- 8 Sri Lanka-related subreddits (srilanka, Colombo, Kandy, Galle, Jaffna, srilankans, srilanka_memes, ceylon) with relevance filtering
-- GDELT global events database (no API key required)
-- World Bank macroeconomic indicators (inflation, GDP, unemployment)
-- NewsAPI integration (optional, requires `NEWS_API_KEY` environment variable)
-
-**Risk Scoring Algorithm (Deterministic):**
-- Base score: 4.0, adjusted by:
-  - VADER sentiment analysis (negative sentiment increases risk)
-  - Crisis keyword detection (26+ weighted terms: crisis, emergency, attack, violence, etc.)
-  - Source reliability weighting (NewsAPI: 0.95, GDELT: 0.85, RSS: 0.80, Reddit: 0.55)
-  - Industry classification boost (Energy, Logistics, Finance, Tourism, Agriculture, Public Safety)
-  - Confidence scoring based on text length, keyword strength, and sentiment magnitude
-- Final score clamped to 1-10 range
-
-**Dashboard Visualization:**
-1. **Geospatial View** - Interactive Pydeck map of Sri Lanka with risk points color-coded by severity
-2. **Business Analytics** - Activity trends, trending keywords, risk distribution histogram, industry impact pie chart
-3. **Live Risk Feed** - Top 20 risks displayed as cards with source, score, sentiment, category, and links
-4. **Health Monitor** - Source status table, performance graphs, collection logs, detailed statistics
-
-**Core Operations:**
-- Auto-start background collector thread (configurable interval, default 120 seconds)
-- Multi-source fallback strategy with retry logic (exponential backoff with jitter)
-- SQLite persistence with MD5-based deduplication
-- 30-day historical data retrieval from GDELT
-- Sidebar controls: collector start/stop, filtering, settings, demo crisis injection, CSV export
+---
 
 ## Project Structure
 
-```text
+```
 National-Risk-Intelligence-Platform/
-  readme.md
-  requirements.txt
-  runtime.txt
-  .env (configuration)
-  app/
-    app.py               (Main Streamlit app with dashboards)
-    collector.py         (Background data collector & risk scoring)
-    config.py            (Configuration management)
-    database_manager.py  (SQLite operations)
-    populate_data.py     (Data seeding utility)
-    data/                (SQLite database)
-    logs/                (Collection logs)
-    modules/
-      news.py            (RSS & NewsAPI collection)
-      social.py          (Reddit collection with filtering)
-    pages/
-      health_monitor.py  (Source health dashboard)
-    utils/
-      sources.py         (Multi-source fallback strategy)
-      health.py          (Source health tracking)
-      resilience.py      (Retry logic & resilience)
-  tests/
-    conftest.py
-    test_database.py
-    test_ingestion_parsing.py
-    test_scoring.py
+├── readme.md
+├── requirements.txt
+├── runtime.txt
+├── .env
+└── app/
+    ├── app.py                    # Main Streamlit dashboard (5 tabs)
+    ├── collector.py              # Background collector + anomaly detector + alert hook
+    ├── config.py                 # All settings, feature flags, thresholds
+    ├── database_manager.py       # SQLite: WAL, FTS5, hourly agg, anomaly log, pruning
+    ├── data/                     # SQLite database
+    ├── logs/                     # Collection logs
+    ├── exports/                  # CSV exports
+    ├── modules/
+    │   ├── news.py               # RSS + NewsAPI collection
+    │   └── social.py             # Reddit RSS collection with relevance filter
+    ├── pages/
+    │   └── health_monitor.py     # Standalone Streamlit health page
+    └── utils/
+        ├── alerts.py             # ← NEW: Webhook + email alert dispatch
+        ├── forecast.py           # ← NEW: Holt-Winters 7-day forecasting
+        ├── health.py             # Source health tracking + type summaries
+        ├── resilience.py         # Retry + exponential backoff
+        └── sources.py            # Multi-source fallback strategy
 ```
 
-## Runtime Flow
+---
 
-1. Start Streamlit from the repository root: `streamlit run app/app.py`
-2. App initializes database and auto-starts background collector thread
-3. Collector runs every `MODELX_REFRESH_INTERVAL` seconds (default: 120 seconds)
-4. Collector pipeline per cycle:
-   - Fetch news from RSS feeds with retry logic
-   - Fetch Reddit posts from 8 subreddits with relevance filtering
-   - Fetch GDELT global events (no API key required)
-   - Fetch World Bank macroeconomic indicators
-   - Apply deterministic risk scoring to each item
-   - Deduplicate against existing database (MD5-based)
-   - Insert new records into SQLite
-5. Dashboard reads from database and renders live visualizations in 3 main tabs + health monitor
+## Feature Flags (.env)
 
-## Requirements
+```env
+# Core
+MODELX_DB_PATH=app/data/modelx.db
+MODELX_REFRESH_INTERVAL=120
+MODELX_FETCH_LIMIT=30
+MODELX_AUTO_REFRESH_DEFAULT=true
+MODELX_RETENTION_DAYS=90
+MODELX_MAX_DB_RECORDS=50000
 
-- Python 3.10+
-- pip
-- Internet connection (for RSS feeds, GDELT, World Bank APIs, and Reddit)
+# APIs (optional)
+NEWS_API_KEY=your_key_here
+ANTHROPIC_API_KEY=your_key_here   # For AI executive summaries
 
-### Dependencies
+# Risk thresholds
+RISK_CRITICAL=8
+RISK_HIGH=6
+RISK_MEDIUM=4
 
-Core packages include:
-- Streamlit (dashboards)
-- pandas (data manipulation)
-- requests (HTTP requests)
-- feedparser (RSS parsing)
-- newspaper3k (article extraction)
-- praw (Reddit API)
-- nltk (VADER sentiment)
-- pydeck (geospatial maps)
-- plotly (interactive charts)
-- tenacity (retry logic)
+# Feature flags
+FEATURE_AI_SUMMARY=false          # Set true to enable AI summaries (requires ANTHROPIC_API_KEY)
+FEATURE_ANOMALY_DETECT=true
+FEATURE_FORECAST=true
+FEATURE_ALERTS=false
+FEATURE_CORRELATION=true
 
-Install all dependencies:
+# Alerts (only used if FEATURE_ALERTS=true)
+ALERT_WEBHOOK_URL=https://hooks.slack.com/...
+ALERT_EMAIL_ENABLED=false
+ALERT_EMAIL_TO=analyst@example.com
+ALERT_SMTP_HOST=smtp.gmail.com
+ALERT_SMTP_PORT=587
+ALERT_SMTP_USER=you@gmail.com
+ALERT_SMTP_PASS=app_password
 
-```bash
-pip install -r requirements.txt
+# World Bank
+WORLD_BANK_COUNTRY=LKA
+WORLD_BANK_INDICATORS=FP.CPI.TOTL.ZG,NY.GDP.MKTP.KD.ZG,SL.UEM.TOTL.ZS,GC.DOD.TOTL.GD.ZS
+HISTORICAL_LOOKBACK_DAYS=30
 ```
+
+---
+
+## Risk Scoring Algorithm
+
+```
+Base: 4.0
+
+Adjustments:
+  + Sentiment:         -compound × 1.5
+  + Crisis keywords:   min(crisis_strength, 5.0)   [32 weighted terms]
+  + Source reliability:(reliability − 0.7) × 2.0
+  + Industry risk:     +0.6 (high-risk) | +0.3 (medium) | +0.0 (general)
+  − Low-signal cap:    capped at 4.0 if personal/advice language detected
+  − Question discount: −1.0 if "?" and crisis_strength < 2.0
+  − Historical:        −1.0 if text references dates before 2010
+  + Finance boost:     +1.0 if bank/fraud/cbsl/deposits detected
+  + Hard floor:        forced ≥ 8.0 if crisis_strength ≥ 3.5 and ≥ 2 keywords matched
+
+Final: clamp(score, 1, 10)
+```
+
+### Confidence Score
+```
+(source_reliability × 0.45)
++ (text_length_norm  × 0.20)
++ (keyword_signal    × 0.25)
++ (|sentiment|       × 0.10)
+```
+
+### Source Reliability Weights
+| Source   | Weight |
+|----------|--------|
+| NewsAPI  | 0.95   |
+| WorldBank| 0.90   |
+| GDELT    | 0.85   |
+| RSS      | 0.80   |
+| Reddit   | 0.55   |
+
+---
+
+## Anomaly Detection
+
+Uses a rolling z-score over the last 24h of hourly buckets per category.
+Anomalies are logged to `anomaly_log` table and displayed as banners in the dashboard.
+
+```
+For each category:
+  z = (latest_avg_score − mean) / std_dev
+  if |z| ≥ 2.5 → flag anomaly
+```
+
+---
+
+## Forecasting
+
+7-day ahead forecast per industry category + overall:
+- Double exponential smoothing (Holt-Winters)
+- Linear trend extrapolation
+- Blended: 60% Holt + 40% linear
+- 95% confidence intervals via residual variance, widening with horizon
+
+Requires at least 3 days of data per category.
+
+---
 
 ## Quick Start
 
-### 1. Clone and Setup
-
 ```bash
+git clone <repo>
 cd National-Risk-Intelligence-Platform
-python -m venv venv
-venv\Scripts\activate  # On Windows
-# source venv/bin/activate  # On macOS/Linux
+python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-```
-
-### 2. Configure Environment
-
-Copy `.env` template and set API keys (optional):
-
-```bash
-# Edit .env with your configuration
-# NEWS_API_KEY is optional - system will fallback to RSS + GDELT if not set
-# WORLD_BANK_COUNTRY and indicators are pre-configured for Sri Lanka
-```
-
-### 3. Run the Application
-
-```bash
+cp .env.example .env   # fill in your keys
 streamlit run app/app.py
 ```
 
-The app will:
-- Open at `http://localhost:8501`
-- Auto-start the background collector thread
-- Display three main dashboards: Geospatial View, Business Analytics, Live Risk Feed
-- Provide source health monitoring page
+---
 
-### 4. Using the Interface
-
-**Sidebar Controls:**
-- **Collector Status**: View collector health and thread status
-- **Search & Filters**: Search by text, filter by sector, select specific sources
-- **Settings**: Adjust collection interval and auto-refresh rate
-- **Demo Crisis**: Inject test risk scenarios for demonstration
-- **Export**: Download filtered data as CSV
-
-### Running Tests
-
-```bash
-pytest tests/
-```
-
-## Environment Configuration
-
-Configure the app via `.env` file in the repository root. Required and optional settings:
-
-**Core Runtime:**
-- `MODELX_DB_PATH` - SQLite database path (default: `app/data/modelx.db`)
-- `MODELX_REFRESH_INTERVAL` - Collector polling interval in seconds (default: `120`)
-- `MODELX_FETCH_LIMIT` - Max records fetched per cycle (default: `20`)
-- `MODELX_AUTO_REFRESH_DEFAULT` - Dashboard auto-refresh toggle (default: `true`)
-
-**Optional APIs:**
-- `NEWS_API_KEY` - NewsAPI key for news aggregation (optional; system falls back to RSS + GDELT if not set)
-- `MASSIVE_API_KEY` - (Reserved for future use)
-- `TWITTER_API_*` - Twitter integration (not currently implemented)
-
-**World Bank Indicators:**
-- `WORLD_BANK_COUNTRY` - Country code (default: `LKA` for Sri Lanka)
-- `WORLD_BANK_INDICATORS` - Comma-separated indicator codes (e.g., `FP.CPI.TOTL.ZG,NY.GDP.MKTP.KD.ZG,SL.UEM.TOTL.ZS`)
-
-## Data Architecture
-
-### Collection Pipeline
-
-Sources are queried in priority order with automatic fallback:
-
-1. **NewsAPI** (if `NEWS_API_KEY` configured)
-2. **RSS Feeds** (10 active Sri Lankan news feeds)
-3. **Reddit** (8 subreddits with relevance filtering)
-4. **GDELT** (global events, no auth required)
-5. **World Bank** (macroeconomic indicators)
-
-Each item is scored using the deterministic risk algorithm, deduplicated via MD5 hash, and inserted into SQLite.
-
-### Database Schema
-
-**Main Table: `risks`**
-- `id` - MD5 hash (source + signal) for deterministic deduplication
-- `source` - Data origin (e.g., "Ada Derana RSS", "Reddit", "GDELT")
-- `signal` - Headline or title
-- `link` - URL to original source
-- `published` - Publication timestamp
-- `risk_score` - Computed risk (1-10 scale)
-- `sentiment_score` - VADER sentiment (-1 to +1)
-- `category` - Industry classification
-- `location`, `district`, `province` - Geographic tags
-- `confidence` - Score confidence (0-1)
-- `keywords` - Detected crisis keywords
-- `created_at`, `updated_at` - Record timestamps
-
-**Supporting Tables:**
-- `historical_collection` - Collection event tracking
-- `locations` - Sri Lanka geographic reference data
-- `risk_trends` - Time series aggregations
-- `data_collection_logs` - Audit trail
-
-### Risk Scoring Algorithm
-
-Each collected item is scored deterministically (1-10):
+## Requirements (additions vs. original)
 
 ```
-Base Score: 4.0
-
-Adjustments:
-+ Sentiment: -sentiment_compound × 1.5 (negative ↑ risk)
-+ Crisis Keywords: min(crisis_strength, 5.0) × 1.0
-+ Source Reliability: (reliability - 0.7) × 2.0
-+ Industry Risk: +0.6 (high-risk) or +0.3 (medium)
-- Question Discount: -1.0 (if contains "?")
-- Historical Discount: -1.0 (if references old dates)
-
-Minimum Boost: 8.0 if ≥3.5 crisis strength + ≥2 keywords matched
-
-Final Score: clamp(computed_score, 1, 10)
+numpy                # forecasting
+anthropic            # AI summaries (optional)
+tenacity             # retry logic (unchanged)
 ```
 
-**Confidence Score** combines:
-- Source reliability (45%)
-- Text length normalization (20%)
-- Keyword signal strength (25%)
-- Sentiment magnitude (10%)
+---
 
-**Source Reliability Weights:**
-- NewsAPI: 0.95
-- GDELT: 0.85
-- World Bank: 0.90
-- RSS feeds: 0.80
-- Reddit: 0.55
-
-**Detected Industries:** Energy & Fuel, Logistics & Transport, Finance & Economy, Tourism, Agriculture, Public Safety
-
-## Testing
-
-Run test suite:
+## Running Tests
 
 ```bash
 pytest tests/ -v
 ```
 
-Test files:
-- `tests/test_database.py` - SQLite operations and deduplication
-- `tests/test_ingestion_parsing.py` - Data collection and parsing
-- `tests/test_scoring.py` - Risk scoring algorithm
-
-## Utility Scripts
-
-- `app/populate_data.py`
-  - Injects sample simulation records into DB for dashboard demos.
-
-## Notes
-
-- If you run from different working directories, ensure `MODELX_DB_PATH` points to one canonical DB file.
-- Streamlit app starts the collector automatically; avoid running multiple app instances against the same DB during demos.
+---
 
 ## License
 
